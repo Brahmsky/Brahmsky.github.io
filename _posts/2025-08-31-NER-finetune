@@ -1,0 +1,186 @@
+---
+layout: post
+title: "NER fine-tune"
+author: "Brahmsky"
+date: 2025-08-31 18:00:00 +0800  # 文章发布日期和时间（可选，但推荐）
+categories: [深度学习, PyTorch]      # 文章分类（可以是多个）
+tags: [Transformer, 注意力机制, NLP] # 文章标签（可以是多个）
+catalog: true                       # 是否显示目录 (根据你的主题)
+header-style: text                  # 头部样式 (根据你的主题)
+---
+
+上来就报错！本节代码需要：降级 `datasets` 到 `2.0.0`（加载数据集问题） + 降级 `evaluate` 到 `0.3.0` （api问题）才能跑。
+
+在Conll2003上微调distilbert-base-uncased。
+先讲一下Conll2003是怎么个事。
+```python
+from datasets import load_dataset  
+from transformers import AutoTokenizer, AutoModelForTokenClassification, DataCollatorForTokenClassification  
+import numpy as np  
+import evaluate  
+from transformers import TrainingArguments, Trainer
+
+DATASET = "conll2003"
+raw_datasets = load_dataset(DATASET)
+# DatasetDict({train/validation/test:Dataset({features:['id','tokens','pos_tags','chunk_tags','ner_tags'],num_rows: 14042/3251/3454})
+```
+ 详细解析`feature`字段：
+ `id`是样本的标识符。
+ tokens是`List[str]`，每一个List\[str]都是经过**基础的空格和标点分词**后的token list。这个预处理的信息**需要传递给tokenizer**，避免其做重复工作。
+ pos_tags是`List[int]`，代表每个token的词性标注；chunk_tags也是一样，代表组块标注，所以这个数据集也可以训练词性标注和组块分析。 
+ ner_tags是`List[List[int]]`，代表每个token的NER_id，使用dslim/bert-NER同款标注体系，9标签（毕竟这个模型就是在Colln2003上预训练的）。在 `datasets` 库的**元数据**中，`ner_tags` 被定义为一个 `Sequence` 特征，其内部元素是 `ClassLabel`。这是一种**高效的数据表示方式**，不仅存储了整数ID，还**内建了ID到标签名（如 'B-PER'）的映射关系**，可以通过 `.features` 属性获取这些信息。
+
+```python
+ner_feature = raw_datasets['train'].features['ner_tags']
+# Sequence(feature=ClassLabel(num_classes=9,names=['O','B-PER','I-PER','B-ORG','I-ORG','B-LOC','I-LOC','B-MISC','I-MISC'],id=None),length=-1,id=None)
+```
+取出来feature中的ner_tags字段后，会发现ner_feature是一个Sequence，告诉你可以通过`raw_datasets['train'][i]['ner_tags']`访问具体样本的label列表。这里的label_names就是索引和标签的映射列表。
+```python
+label_names = ner_feature.feature.names 
+# ['O', 'B-PER', 'I-PER', 'B-ORG', 'I-ORG', 'B-LOC', 'I-LOC', 'B-MISC', 'I-MISC']
+```
+到此，这个数据集所有的原始材料就准备好了。
+
+在一个通用的、在MLM任务上预训练好的模型上做NER微调，模型结构肯定是要改的。AutoModel需要具体的参数去指定结构，初始化或调整分类头。
+```python
+MODEL_NAME = "distilbert-base-uncased"
+tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+model = AutoAutoModelForTokenClassification.from_pretrained(  
+    MODEL_NAME,  
+    num_labels=len(label_names),
+    id2label = {str(i): label for i, label in enumerate(label_names)},
+    label2id = {label: i for i, label in enumerate(label_names)},  
+)
+```
+num_labels参数，指定模型**分类头维数**。模型分类头修改了，**id2label和labe2id也需要指定**，好在model的config中能保存和加载。你会发现id2label是一个`str(int)-->label`的映射，这是由于**JSON的键必须是字符串**。
+提一嘴，`num_labels` 这个参数并非`from_pretrained` 方法本身的直接参数，实际上是通过 `**kwargs` 传递给模型内部的 `config` 对象的。没错，AutoClass的from_pretraied()方法是工厂方法。
+调用 `AutoModelForTokenClassification.from_pretrained(MODEL_NAME, num_labels=len(label_names))` 时：`from_pretrained` 方法首先加载 `MODEL_NAME` 对应的 `config.json` 文件，并创建一个 `PretrainedConfig` 对象。然后会将 `num_labels=len(label_names)` 这个参数**注入**到这个 `config` 对象中（即 `config.num_labels = len(label_names)`）。然后，根据这个更新后的 `config` 对象，来**实例化**具体的模型类（如 `DistilBertForTokenClassification`）。这个具体的模型类在 `__init__` 方法中，会从 `config` 对象中读取 `num_labels`，并据此构建其顶部的分类头。这种设计，允许在加载模型时动态地调整其下游任务相关的配置。
+
+广义上讲，Hugging Face `transformers` 库中的所有 `AutoModel.from_pretrained()` 和 `AutoTokenizer.from_pretrained()` 方法都可以被视为“工厂函数”或“工厂方法”。`AutoModel`, `AutoTokenizer` 本身就是工厂类，给它一个模型名，就能自动识别并返回对应的具体模型类的实例。`from_pretrained()` 方法也能通过参数注入完成不同的实例化。
+
+然后，是这一节重中之重，**标签对齐label alignment**。回顾tokenizer的输出，会是一个BatchEncoding对象，包含input_ids(`List[List[int]]` 或 `torch.Tensor` 若 `return_tensors="pt"`，
+encode后喂给模型模型的输入)、相同形状的attention_mask、token_type_ids。回顾前面的SA任务：
+```python
+tokenized_tr_set = va_set.map(sample_tokenize, batched=True, num_proc=4)#Dataset({features:['text','label','input_ids','token_type_ids','attention_mask'],num_rows: 25000})
+tokenized_tr_set = tokenized_tr_set.remove_columns(['text']).rename_column("label", "labels").with_format("torch")
+```
+我们手动处理了输入的labels。SA中的处理逻辑并不复杂，简单的移除、重命名、格式转换就完成了。为啥能这么简单？因为SA的imdb数据集，这个Dataset类本身就有一个label键名，存储着对应每一个样本的label，而label的流动完全**与分词过程解耦**。训练集送入tokenizer时，`tokenizer` 会把 `"text"` 变成 `input_ids` 和 `attention_mask`，而完全不关心 `label`。`label` 独立于处理逻辑之外，跟着数据流走下来，原封不动就行了。
+这时来到NER，词元级任务，每个样本有一系列标签，与**一系列**单词对应。raw_dataset中，经过**基础分词**后的每个token和id是一一对应的。这时，`tokenizer` 的影响就是灾难性的！会把 `tokens` 列表进一步切分，变成一个**长度不同**的 `input_ids` 列表，就无法与raw_dataset一一对应了。因此，**必须有一个处理逻辑，重建token到id的1-to-1映射**。
+除此以外，你会发现Conll2003的feature里面压根没有labels列。而trainer的硬性要求，便是期望在`train_dataset` 和 `eval_dataset` 中的每一个样本中，都能找到这三个关键的键：
+    1. **`input_ids`**: 模型的输入ID序列。
+    2. **`attention_mask`**: 注意力掩码。
+    3. **`labels`**: 真实的标签。
+
+这两点就综合决定了，你必须**手动创建一个全新的标签序列labels！** 而且这个新序列的长度必须和 `tokenizer` 生成的 `input_ids` 序列的长度完全一样。
+
+手动创建的过程，就是`tokenize_and_align_labels`函数的核心：利用 `word_ids` 这个“地图”，将原始的 `ner_tags` 信息，**重新**标注到新的、更长的子词序列上。最后，将这个对齐好的标签序列作为一个**新的键 `'labels'`** 添加到 `tokenizer` 的输出字典中。是的，就是添加一个键。
+
+注意这里，tokenizer的参数`is_split_into_words=True`，告诉 tokenizer 函数输入已经是一个单词列表了，不需要再进行基于空格或规则的基础分词，只需要在此基础上进行子词（subword）切分和转换为ID。
+```python
+def tokenize_and_align_labels(examples):  
+    tokenized_inputs = tokenizer(examples['tokens'], truncation=True, is_split_into_words=True)
+    labels = []  
+    for i, label in enumerate(examples['ner_tags']):  
+        word_ids = tokenized_inputs.word_ids(batch_index=i)
+        previous_word_idx = None  
+        label_ids = []  
+        for word_idx in word_ids:  
+            if word_idx is None: # 这里也能提一嘴，也是没谁了！  
+                label_ids.append(-100)  
+            elif word_idx == previous_word_idx:  
+                label_ids.append(-100)  
+            else:  
+                label_ids.append(label[word_idx])  
+            previous_word_idx = word_idx  
+        labels.append(label_ids)  
+    tokenized_inputs['labels'] = labels 
+    
+    return tokenized_inputs
+```
+ `word_ids = tokenized_inputs.word_ids(batch_index=i)`，这一行是关键。`BatchEncoding`的`.word_ids(batch_index=i)`可以当前处理的批次中（处理批次的逻辑在map中写）第 i 个样本的 word_ids。输出是一个**与分词后的子词序列**长度相同的列表word_ids，每个元素是 integer 或 None：整数 j 表示当前子词（subword）来自于原始单词列表 `examples["tokens"][i]` 中的第 j 个单词。None 表示当前这个子词是一个特殊Token（如 [CLS], [SEP], [PAD]），它不对应任何原始单词。  
+
+整个逻辑就是：为每个样本创建一个待填充的标签序列`label_ids`。取出批次中每个样本的原标签序列`label`，然后遍历该样本tokenized后获取到的子词-->原词索引序列，同时维护一个pre下标指向该子词的前一个子词。如果当前子词的word_id是None（说明这里是特殊字符）或者和前一个子词的word_id相等（说明当前子词是前一个子词的后缀），就在`label_ids`添加一个`-100`的标签，代表这里不参与损失的计算（-100是约定的特殊填充值，`DataCollatorForTokenClassification`会用-100去填充labels，`AutoModelForTokenClassification` 内部的 `CrossEntropyLoss`，ignore_idx的dafault就是-100，看到-100会忽略这里，让它不参与损失计算）；如果当前word_id不是None并且没有和前一个子词撞车，就顺着找回原标签序列，取出`label[word_id]`，添加到`label_ids`中。这样每一个`label_ids`填充好以后，挨个塞进`labels`列表。labels整体作为新的键名‘labels’添加到tokenized_inputs，最终返回获得了新键的tokenized_inputs。
+
+嫌这一段又臭又长，看这个：
+有了 `word_ids` 列表，我们就可以轻松地实现标签对齐逻辑：
+1. **跳过特殊Token**: 只要 `word_id` 是 `None`，我们就知道这是特殊Token，直接给它 `-100` 标签。
+2. **找到原始单词标签**: 对于每个子词，`word_id` 告诉我们它对应原始单词列表中的哪个单词。我们就可以用 `label[word_id]` 来获取这个原始单词的标签。
+3. **处理后续子词**: 如果一个单词被切分成了多个子词（例如 `"German"` -> `ger`, `##man`），那么这些子词的 `word_id` 都是相同的（例如都是 `2`）。通过比较 `word_id` 和 `previous_word_idx`，我们就能判断当前子词是否是某个单词的**第一个子词**。
+    - 如果是第一个子词，我们赋给它原始标签（例如 `B-MISC`）。
+    - 如果是后续子词，我们赋给它 `-100` 标签，避免重复计算损失。
+
+有人就问了，为什么和前一个子词撞车的子词要打上-100标签？**核心原因：避免重复计算损失，确保每个原始单词的实体标签只贡献一次损失**。万一来了一个超级分词B-misc,I-misc，光是B-misc就分出来十几个子词，这样这一个词的贡献就重复算了十几遍，模型就会看什么都像B-misc。
+
+这种只在第一个子词上计算损失的策略，称为“**头方案**”（Head Scheme）。在序列标注任务中，还有其他的对齐策略，比如“全方案”（给所有子词都赋上相同的标签），但“头方案”目前最常用、效果也最稳定，业界主流。
+
+用map方法处理训练集、验证集、测试集，batch的处理在这儿。
+```python
+tokenized_datasets = raw_datasets.map(tokenize_and_align_labels, batched=True)  
+print("Preprocess completed!")
+```
+
+```python
+data_collator = DataCollatorForTokenClassification(tokenizer=tokenizer) # 通过tokenizer显式的传入给input_ids做padding的padding_idx，但是给labels做padding的padding_idx就用DataCollatorForTokenClassification自己的default值
+
+metric = evaluate.load('seqeval')  
+def compute_metrics(inputs):  
+    predictions, labels = inputs # 解包出两个3D ndarray  
+    predictions = np.argmax(predictions, axis=-1)  
+  
+    true_predictions = [  
+        [label_names[p] for (p, l) in zip(prediction, label) if l != -100]  
+        for prediction, label in zip(predictions, labels)  
+    ]  
+    true_labels = [  
+        [label_names[l] for (p, l) in zip(prediction, label) if l != -100]  
+        for prediction, label in zip(predictions, labels)  
+    ]  
+  
+    res = metric.compute(predictions=true_predictions, references=true_labels)  
+    return {  
+        'precision': res['overall_precision'],  
+        'recall': res['overall_recall'],  
+        'f1': res['overall_f1'],  
+		'accuracy': res['overall_accuracy'],
+    }
+```
+注意这里要手动过滤-100，因为评估函数是你自己写，没有一个流程会自动忽略-100。
+
+哎，然后这里的这几个指标，精确率，召回率，f1分数，又够你喝一壶！
+详细介绍看这里吧：[[0.分类指标]]
+
+```python
+training_args = TrainingArguments(  
+    output_dir="ner_model",  
+    learning_rate=2e-5,  
+    per_device_train_batch_size=64,  
+    per_device_eval_batch_size=16,  
+    num_train_epochs=3,  
+    weight_decay=0.01,  
+    eval_strategy="epoch",  
+    save_strategy="epoch",  
+    load_best_model_at_end=True,  
+)  
+  
+trainer = Trainer(  
+    model=model,  
+    args=training_args,  
+    train_dataset=tokenized_datasets["train"],  
+    eval_dataset=tokenized_datasets["validation"],  
+    tokenizer=tokenizer, # 让Trainer能正确地保存分词器，并作为创建默认data_collator备用选项
+    data_collator=data_collator,  
+    compute_metrics=compute_metrics,  
+)  
+  
+print("--- 开始微调训练 ---")  
+trainer.train()  
+print("--- 训练完成！ ---")  
+  
+print("\n--- 评估最终模型性能 ---")  
+eval_results = trainer.evaluate(tokenized_datasets["test"])  
+print(eval_results)
+```
+
+最后顺带提一句，看标签对齐函数中的`if word_idx is None:` `is`和`==`用于比较对象时存在本质区别：is是比较两个对象的‌**内存地址**‌是否相同，即是否为同一个对象，适用于检查对象身份，例如单例对象（如`None`）或可变对象的引用一致性；`==`操作符比较两个对象的‌**值**‌是否相等（通过调用`__eq__()`方法实现）适用于内容比较，例如列表、字符串等不可变类型的值匹配。
+`None`是Python中的单例对象，所有`None`引用指向同一内存地址。因此`is None`比`== None`更高效且更pythonic。
+
