@@ -1,0 +1,148 @@
+---
+layout: post
+title: "代价函数和反向传播"
+author: "Brahmsky"
+date: 2025-08-07 18:00:00 +0800  # 文章发布日期和时间（可选，但推荐）
+categories: [深度学习, PyTorch]      # 文章分类（可以是多个）
+tags: [Transformer, 注意力机制, NLP] # 文章标签（可以是多个）
+catalog: true                       # 是否显示目录 (根据你的主题)
+header-style: text                  # 头部样式 (根据你的主题)
+---
+
+代价函数这个东西，只是用来更新参数最优化时的一个凭据。代价函数的设计并不要求 a=y 时为 0，只要求此时达到全局最小值。两个基本假设：
+## 1.整体代价函数是单个训练样本代价函数的平均值
+  反向传播算法正是设计来高效计算**单个样本**的梯度的。如果没有这个假设，或者如果 C 是一个更复杂的非线性组合，那么反向传播的推导会变得异常复杂，甚至可能无法直接应用。
+
+## 2.代价函数可以表示成神经网络输出的函数
+  如果 C 不直接依赖于**输出层的加权输入** ，那么反向传播的链式法则就无法从输出层开始向后传播。这个假设**将代价函数的具体形式与反向传播的核心机制解耦**，使得反向传播算法和通用框架可以适用于**任何**满足该条件的代价函数，如均方误差、交叉熵损失。
+  
+
+反向传播的最终目标：**计算C对所有层w和b的偏导数**
+最终目标是计算$\frac{\partial C}{\partial w_{jk}^l}$和$\frac{\partial C}{\partial b_j^l}$，计算这些偏导数就首先会涉及到求$\frac{\partial C}{\partial z_j^l}$，因为$$
+z_j^{(l)} = \sum_{k} w_{jk}^{(l)} a_k^{(l-1)} + b_j^{(l)}
+$$
+所以如果定义“误差”为$\delta_j^l \equiv \frac{\partial C}{\partial z_j^l}$，代表**代价函数对前一层加权输入的(偏)导数**，也就是“**第 l 层第 j 个神经元的带权输入 z​ 的微小变化，会对最终的代价函数 C 产生多大“幅度”的影响**”，就不难得出$\frac{\partial C}{\partial z_j^l} = \frac{\partial C}{\partial a_j^l} \cdot \frac{\partial a_j^l}{\partial z_j^l} = \frac{\partial C}{\partial a_j^l} \cdot \sigma'(z_j^l)$。写成矩阵形式，就是$\delta^L = \nabla_a C \odot \sigma'(z^L)$。**(BP1，输出层误差方程)**
+
+然后就是C对最后一层的带权输入如何通过W传导到前一层，去递归地得到C对每一层带权输入的偏导数(“误差”向前传导)。我们想要计算$\delta^l = \frac{\partial C}{\partial z^l}$，已知$\delta^{l+1} = \frac{\partial C}{\partial z^{l+1}}$，所以$\frac{\partial C}{\partial z^l_j} = \sum_k \frac{\partial C}{\partial z^{l+1}_k} \frac{\partial z^{l+1}_k}{\partial z^l_j}$
+又$z^{l+1}_k = \sum_p w_{kp}^{l+1} \sigma(z_p^l) + b_k^{l+1}$，对第j项带权输入求偏导只有第j项会被保留，于是$\frac{\partial z^{l+1}_k}{\partial z^l_j} = w_{kj}^{l+1} \sigma'(z_j^l)$。把结果带回$\delta^l_j = \frac{\partial C}{\partial z^l_j} = \sum_k \delta^{l+1}_k \cdot w_{kj}^{l+1} \sigma'(z_j^l) = \left( \sum_k w_{kj}^{l+1} \delta^{l+1}_k \right) \sigma'(z_j^l)$。
+
+回忆一下矩阵乘法：$A = BC$，则$A_{ij} = \sum_k B_{ik} C_{kj}$，现在的情况是这个B项的行和列倒置了，作为结果的第j项，所以最终误差的表示结果就是$\delta^l = ((W^{l+1})^T \delta^{l+1}) \odot \sigma'(z^l)$。**(BP2，误差反向传播方程)**
+
+然后，由于$z_j^l = \sum_k w_{jk}^l a_k^{l-1} + b_j^l$，于是$\frac{\partial C}{\partial b_j^l} = \delta_j^l$。**(BP3，偏置梯度方程)**
+$\frac{\partial C}{\partial w_{jk}^l} = a_k^{l-1} \delta_j^l$。**(BP4，权重梯度方程)**
+
+于是整个反向传播过程：
+1.应用BP1，计算输出层误差
+2.应用BP2，为每一层计算误差
+3.应用BP3和BP4计算w和b的梯度
+![[Pasted image 20250728184216.png]]
+这里的偏置梯度向量化，直接nabla_b[-1] = delta即可
+权重梯度向量化，看矩阵中每一项，下标写完整后实际的形式是ak1 * deltaj1，deltaj1 * ak1需要对a做转置才能正确表达，即权重梯度nabla_w[-1] = np.dot(delta, activations[-2].T)
+
+现在加入batch维度，无非就是用这一组batch的平均值来确定**一次更新**(和单个样本一样只更新一次，只不过确定样本更新的依据由一个样本变成了一个batch)：
+BP1：$\Delta^L = \nabla_A C \odot \sigma'(Z^L)$，其中$\nabla_A C_{batch} = \frac{1}{m} (A^L - Y)$(MSE)
+BP2：$\Delta^l = ((W^{l+1})^T \Delta^{l+1}) \odot \sigma'(Z^l)$
+BP3：$\frac{\partial C}{\partial b^l} = \frac{1}{m} \sum_{i=1}^{m} \delta_i^l$
+BP4：$\frac{\partial C}{\partial W^l} = \frac{1}{m} \sum_{i=1}^{m} \delta_i^l (a_i^{l-1})^T$
+前面的update方法，batchsize已经丢给学习率了，所以如果写batch_size的话backprop只需要叠加梯度，不用求平均。
+  对于BP1，C是批次中每一个样本的C平均值，依然是一个单一的数值。但是在反向传播的过程中，根本不需要计算出C具体的值（事实上这一部分代码根本就不关心具体的C值是多少）。在整个训练过程中，C值起到的主要是评估作用，具体的C值不对参数更新产生任何影响。这里的误差矩阵就简单推广为m列的矩阵减法，激活矩阵A-标签矩阵Y.
+  
+  对于BP2，原先的向量向前传播可以轻易推广到误差矩阵向前传播
+  
+  对于BP3，我们希望得到的是**整个批次**对第 l 层第 j 个偏置 $b_j^l$ 的梯度。这个梯度是批次中所有样本贡献的梯度之和(为什么不是平均值，上一段解释过了)。$\frac{\partial C_{batch}}{\partial b_j^l} = \sum_{i=1}^{m} \frac{\partial C_{x_i}}{\partial b_j^l} = \sum_{i=1}^{m} \delta_{j,i}^l$，只需要对$\Delta^l$的每第 j 行求和`np.sum(delta, axis=1, keepdims=True)`。
+  
+  对于BP4，我们希望得到的是**整个批次**所有样本对连接第 l−1 层第 k 个神经元到第 l 层第 j 个神经元的权重 $w_{jk}^l$​ 贡献的梯度之和。$\frac{\partial C_{batch}}{\partial w_{jk}^l} = \sum_{i=1}^{m} a_{k,i}^{l-1} \delta_{j,i}^l$，通过矩阵乘法$\nabla_W C_{batch}^{(l)} = \Delta^l (A^{l-1})^T$`np.dot(delta, activations[-l - 1].T)`实现。
+  
+接下来写代码，首先来尝试处理单个样本，同时回顾update如何配合单样本bp：
+```python
+def backprop(self, x, y):#x, y:(input_size/output_size, 1)
+#计算出来两个列表，列表中的每一个元素都是一个矩阵，delta_nabla_b的每一个元素是(current_layer, 1)矩阵/向量，代表该层偏置梯度；delta_nabla_w的每一个元素是`(output_layer, input_layer)`的矩阵，代表前一层到该层的权重梯度矩阵
+	nabla_b = [np.zeros(b.shape) for b in self.biases]
+	nabla_w = [np.zeros(w.shape) for w in self.weights]
+	activation = x
+	activations = [x]
+	zs = []
+	for b, w in zip(self.biases, self.weights)
+		z = np.dot(w, activation) + b
+		zs.append(z)
+		activation = sigmoid(z)
+		activations.append(activation)
+		
+	delta = self.cost_derivative(activations[-1], y) * sigmoid_prime(zs[-1])#BP1
+	nabla_b[-1] = delta#BP3
+	nabla_w[-1] = np.dot(delta, activations[-2].T)#BP4
+		
+	for l in range(2, self.num_layers):
+		z = zs[-l]
+		delta = np.dot(self.weights[-l + 1].T, delta) * sigmoid_prime(z)#BP2
+		nabla_b[-l] = delta#BP3
+		nabla_w[-l] = np.dot(delta, activations[-l - 1].T)#BP4
+	return (nabla_b, nabla_w)	
+
+def update(self, mini_batch, eta):#对一个batch应用梯度下降和反向传播更新参数
+	batch_size = len(mini_batch)
+	nabla_b = [np.zeros(b.shape) for b in self.biases]
+	nabla_w = [np.zeros(w.shape) for w in self.weights]#初始化累加器形状
+	for x, y in mini_batch:#累加每一个b和w矩阵的梯度
+		delta_nabla_b, delta_nabla_w = self.backprop(x, y)
+		nabla_b = [nb + dnb for nb, dnb in zip(nabla_b, delta_nabla_b)]
+		nabla_w = [nw + dnw for nw, dnw in zip(nabla_w, delta_nabla_w)]
+	self.weights = [w - eta/batch_size * nw for w, nw in zip(self.weights, nabla_w)]
+	self.biases = [b - eta/batch_size * nb for b, nb in zip(self.biases, nabla_b)]
+
+```
+然后是处理batch版本：
+```python
+def backprop(self, x_batch, y_batch):#x, y:(input_size/output_size, batch_size)
+#但是输出的两个list和上面的结果形式是完全一样的
+	nabla_b = [np.zeros(b.shape) for b in self.biases]
+	nabla_w = [np.zeros(w.shape) for w in self.weights]
+	activation = x_batch
+	activations = [x_batch]
+	zs = []
+	for b, w in zip(self.biases, self.weights)
+		z = np.dot(w, activation) + b
+		zs.append(z)
+		activation = sigmoid(z)
+		activations.append(activation)
+		
+	Delta = self.cost_derivative(activations[-1], y_batch) * sigmoid_prime(zs[-1])#BP1
+	nabla_b[-1] = np.sum(Delta, axis = 1, keepdims=True)#这里出现了第一处明显的改动，应用BP3求偏置矩阵时需要对每行求和
+	nabla_w[-1] = np.dot(Delta, activations[-2].T)#BP4,这里不用显式的改动
+		
+	for l in range(2, self.num_layers):
+		z = zs[-l]
+		Delta = np.dot(self.weights[-l + 1].T, Delta) * sigmoid_prime(z)#BP2
+		nabla_b[-l] = np.sum(Delta, axis = 1, keepdims=True)#BP3，依然是一样的改动
+		nabla_w[-l] = np.dot(Delta, activations[-l - 1].T)#BP4
+	return (nabla_b, nabla_w)	
+```
+此时，update方法也需要做出改动：
+```python
+def update(self, mini_batch, eta):#mini_batch是一个(x, y)元组列表，需要首先转换为 (input_size, m) 和 (output_size, m) 的 NumPy 数组	
+	batch_size = len(mini_batch)
+	mini_batch_x = np.array([item[0] for item in mini_batch]).T
+    mini_batch_y = np.array([item[1] for item in mini_batch]).T
+
+	nabla_b, nabla_w = self.backprop_batch(mini_batch_x, mini_batch_y)
+
+	self.weights = [w - eta/batch_size * nw for w, nw in zip(self.weights, nabla_w)]
+	self.biases = [b - eta/batch_size * nb for b, nb in zip(self.biases, nabla_b)]
+```
+
+对比这两种代码，不难发现如果只是看bp的代码，那么后一种加入batch的实现可以完美包含第一种只能处理单个样本的实现，而且从代码逻辑上，两种结果最后得到的权重和偏置梯度是**完全一样的**。第一份代码和第二份处理batch的代码(bp + update)的本质区别在于：第二种更快，矩阵运算将循环推入了底层优化的代码中，避免了for loop
+
+考虑整个前向传播和反向传播结合起来的特点：
+为什么在一众参数w、b、a、z中选择了将$\delta = \partial C / \partial z$作为中间量？因为：
+1. ∂C/∂z 可以通过链式法则从后一层 δ 方便地计算出来（BP2）。
+2. 一旦有了 δ ，计算 ∂C/∂w 和 ∂C/∂b 就变得非常简单（BP3 和 BP4），因为 z 对 w 和 b 的偏导数非常简单。
+3. 在a和z中选择计算C对z偏导，是为了让**BP3 和 BP4 的形式最简洁**，为了数学上的简洁和实现上的便利
+其优势在于，反向传播算法仅仅需要**一次前向传播+一次反向传播**，就能计算出所有参数对C的梯度，而反向传播和前向传播的计算代价可以看成相同的，因为GPU主要计算开销和瓶颈都在计算权重矩阵（或其转置矩阵）参与的大型矩阵乘法。
+
+考虑如果是对w求梯度：$\frac{\partial C}{\partial w_j} \approx \frac{C(w + \epsilon e_j) - C(w)}{\epsilon}$，这是一种朴素的算法，为了计算 ∂C/∂wj，需要：
+首先算 C(w) 作为原始代价，然后将 wj​ 增加一个微小量 ϵ ，计算 C(w+ϵej​) 作为引入了微扰后的代价），为了计算**一个**权重 wj 的偏导数，需要计算**两次**代价函数 C，需要两次前向传播。
+如果是P个参数，每一个样本需要2P次前向传播，但是反向传播算法中每一个样本**只需要约2次前向传播的计算量**，一次性计算出样本损失对所有参数的梯度。这相当于摆脱了训练样本数量限制。
+
+**反向传播算法可以被理解为一种巧妙地追踪网络中微小变化（扰动）如何从一个神经元传播到另一个神经元，最终影响到代价函数的过程。通过这种方式，它能够高效地计算出代价函数对所有权重和偏置的偏导数**，引入 δ 并利用链式法则的结构，将这种复杂的追踪过程**分解为一系列简单的、可复用的步骤**，**高效地组织起来**，复用中间计算结果提高了计算的效率
+
+有了反向传播，可以继续讨论更多问题了。见下一章。
